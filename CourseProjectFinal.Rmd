@@ -1,0 +1,218 @@
+```{r includes, echo=FALSE, results="hide"}
+library(stats)
+library(lattice)
+library(ggplot2)
+library(grid)
+library(gridExtra)
+library(caret)
+library(utils)
+library(graphics)
+library(datasets)
+```
+
+Practical Machine Learning - Course Project
+===========================================
+
+## Objectives
+
+We are asked to determine how well individuals perform a weight lifting exercise using human-activity-recognition data captured by accelerometers. 
+
+We need to answer the following questions:  
+- how did we built the predictive model: we used random forests  
+- how did we handle cross validation: we carved out a validation partition in the data and tested the model aganst it  
+- what is the expected out of sample error (will be presented below)  
+- what is the rationale for the choices made (will be explained thougout the document)  
+
+## Getting and Cleaning Data
+
+First, we load the two input datasets that we'll use train and test our solution. 
+
+The data was obtained from: Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.
+
+```{r loadData, results="hide",  cache=TRUE}
+training.all <- read.csv("./pml-training.csv", na.strings = c("NA","#DIV/0!"))
+testing      <- read.csv("./pml-testing.csv",  na.strings = c("NA","#DIV/0!"))
+```
+
+Next, we split the first dataset in two partitions: A "training" partition that we'll use to build models and a "validation" partition to estimate the "out of sample error" of the final model that we select.
+
+```{r splitData, results="hide",  cache=TRUE}
+#First split:
+set.seed(13925)
+inTrain    <- createDataPartition(y = training.all$classe, p=0.7, list=FALSE)
+validation <- training.all[-inTrain,]
+training   <- training.all[inTrain,]
+```
+
+We have 160 variables in these datasets but after looking at the contents (not printed due to space) I decided to drop the following variables (rationale explained):
+- Variables with missing values in the training set for every record that is not a new window (their values are missing in the testing set)  
+- Subject identity (if we keep it as a predictor, the model won't generalize to other subjects)
+- Time stamps (could be used for feature extraction but not for model training since the same values won't repeat in future exercises)  
+- Start of new window (a periodic timing factor that doesn't seem to be relevant for this prediction)
+- Sequential numbers (irrelevant for prediction)
+
+```{r subsetData, echo=FALSE, results='hide',  cache=TRUE} 
+#Drop variables with missing values
+nonMissVars <- !apply(is.na(testing), 2, all)
+training    <- training[,  nonMissVars]
+validation  <- validation[,nonMissVars]
+testing     <- testing[,   nonMissVars]
+
+#Drop the variables that dont make sense to keep as predictors
+removeVars <- c('X','raw_timestamp_part_1','cvtd_timestamp','raw_timestamp_part_2','user_name','new_window','num_window')
+keepVars   <- !(colnames(training) %in% removeVars)
+training   <- training[,   keepVars]
+validation <- validation[, keepVars]
+testing    <- testing[,    keepVars]
+```
+
+After all these changes to the datasets, here are the number of variables and observations:
+
+```{r countData, echo=FALSE, cache=TRUE} 
+#Print the counts in the 4 datasets:
+printDims <- function () {
+    cat('training:  ',dim(training),   '\n')
+    cat('validation:',dim(validation), '\n')
+    cat('testing:   ',dim(testing),    '\n')    
+}
+printDims()
+```
+
+
+## Exploratory Data Analysis  
+
+Now we should look deeper into the data. First, we'll look at the distribution of the target variable:
+
+```{r plotTarget, echo=FALSE, cache=TRUE, fig.width=9, fig.height=6} 
+qplot(classe, fill=classe, data=training, main="Figure 1. Target Variable (class)") 
+```
+
+Next, we'll look at the predictor variables ploted against our target variable and against each other (I am showing only 4 predictors due to space):
+
+```{r plotPredictors1, echo=FALSE, cache=TRUE, fig.width=9, fig.height=6} 
+g1 <- ggplot(training, aes(yaw_forearm, roll_forearm))
+g2 <- ggplot(training, aes(yaw_arm, roll_arm))
+g1 <- g1 + geom_point(aes(color=classe),size=4, alpha=1/5)
+g2 <- g2 + geom_point(aes(color=classe),size=4, alpha=1/5)
+g1 <- g1 + ggtitle("Figure2. Some Original Predictors")
+grid.arrange(g1, g2, ncol=1, nrow=2)
+```
+
+In this case, we observe patterns that are not simple and not linear. We will need a model that offers a great degree of flexibility such as a random forest. 
+
+In order to reduce the number of predictors while capturing the maximum amount of variability in the data, I will generate the "principal components":
+
+```{r preProcessData, cache=TRUE} 
+#Set the target and ID variables aside (PC does not apply to them)
+predictorVars1  <- !(colnames(training) %in% c('classe'))
+predictorVars2  <- !(colnames(testing) %in% c('problem_id'))
+
+#Pre-process the training data
+preObj          <- preProcess(training[,predictorVars1], method=c("center", "scale", "pca"), thresh = 0.95)
+
+#Apply the transformation to all datasets
+training.prep   <- cbind(classe=training$classe,        predict(preObj, training[,  predictorVars1])); 
+validation.prep <- cbind(classe=validation$classe,      predict(preObj, validation[,predictorVars1])); 
+testing.prep    <- cbind(problem_id=testing$problem_id, predict(preObj, testing[,   predictorVars2]));
+```
+
+Here are some of the principal components plotted against the target variable:
+
+
+```{r plotPredictors2, echo=FALSE, cache=TRUE, fig.width=9, fig.height=6} 
+g1 <- ggplot(training.prep, aes(PC1,  PC2))
+g2 <- ggplot(training.prep, aes(PC10, PC15))
+g1 <- g1 + geom_point(aes(color=classe),size=4, alpha=1/5)
+g2 <- g2 + geom_point(aes(color=classe),size=4, alpha=1/5)
+g1 <- g1 + ggtitle("Figure3. Some Principal Compoents")
+grid.arrange(g1, g2, ncol=1, nrow=2)
+```
+
+Looking at these plots, its not immediately clear to me whether the original variables or the principal components will predict better the target variable. Therefore I will train two models and compare them to each other. 
+
+## Predictive Modeling  
+
+Given that we have a categorical predictor and non-linear relationships, I will chose a random forest model. This model is time consuming but has great predictive power. I will use a number of trees smaller than the default of 500 because, after testing this process a couple of times, I concluded this produces good results.
+
+```{r modelData1, cache=TRUE} 
+#Model 1: With original predictors
+model1 <- train(classe ~ . , method="rf", data=training, ntree=100)
+```
+
+```{r modelData2, cache=TRUE} 
+#Model 2: With principal components
+model2 <- train(classe ~ . , method="rf", data=training.prep, ntree=100)
+```
+
+
+## Model Comparison
+
+We will apply both models to the validation data and see which one performs better:
+
+```{r crossValidation, cache=TRUE} 
+cross.validation1 <-predict(model1, newdata=validation)
+cross.validation2 <-predict(model2, newdata=validation.prep)
+```
+
+These are the cross validation results for Model 1:
+
+```{r crossValidationResults1,  echo=FALSE, cache=TRUE, fig.width=9, fig.height=6} 
+confusionMatrix(cross.validation1, validation$classe)
+```
+
+And here are the cross validation results for Model 2:
+
+```{r crossValidationResults2,  echo=FALSE, cache=TRUE, fig.width=9, fig.height=6} 
+confusionMatrix(cross.validation2, validation.prep$classe)
+```
+
+```{r crossValidationResults3,  echo=FALSE} 
+#Calculate winner
+accuracy1 <- sum(cross.validation1==validation.prep$classe)/length(validation.prep$classe)
+accuracy2 <- sum(cross.validation2==validation.prep$classe)/length(validation.prep$classe)
+if (accuracy1 > accuracy2) {
+    bestmodel = "Model 1 (with original predictors) is the best model"
+    accuracy  = accuracy1
+} else if (accuracy2 > accuracy1) {
+    bestmodel = "Model 2 (with principal components) is the best model"
+    accuracy  = accuracy2
+} else {
+    bestmodel = "Both models tied."
+    accuracy  = accuracy2    
+}
+```
+
+
+In conclusion, `r bestmodel` and the accuracy level reached is `r accuracy` which means that the "out of sample"" error can be estimate as `r round((1-accuracy)*100,1)` percent.
+
+Strictly speaking, with a randomforest we don't have a need for cross validation because the model itself produces a good estimate of the  out of sample error but we have plenty of data so i decided to still test it like this. 
+
+
+## Results  
+
+Now we are ready to score the test data in order to predict the class of each record.
+
+```{r results, cache=TRUE} 
+#Score the testing data
+results1 <- as.character(predict(model1, newdata=testing))
+results2 <- as.character(predict(model2, newdata=testing.prep))
+
+#Save the results in files ready for upload
+pml_write_files = function(x, model_dir, model_name){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0(model_dir,"/",model_name,"problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+pml_write_files(results1,"./results","model1_")
+pml_write_files(results2,"./results","model2_")
+
+#Print predictions from model 1
+results1
+
+#Print predictions from model 2
+results2
+```
+
+
